@@ -109,6 +109,8 @@ enum enum_slave_type_conversions { SLAVE_TYPE_CONVERSIONS_ALL_LOSSY,
 enum enum_slave_rows_search_algorithms { SLAVE_ROWS_TABLE_SCAN = (1U << 0),
                                          SLAVE_ROWS_INDEX_SCAN = (1U << 1),
                                          SLAVE_ROWS_HASH_SCAN  = (1U << 2)};
+enum enum_slave_pr_mode { SLAVE_PR_MODE_SCHEMA,
+                          SLAVE_PR_MODE_TABLE };
 
 enum enum_mark_columns
 { MARK_COLUMNS_NONE, MARK_COLUMNS_READ, MARK_COLUMNS_WRITE};
@@ -576,6 +578,7 @@ typedef struct system_variables
   */
   my_bool show_old_temporals;
   ulong rds_sql_max_iops;
+  my_bool sequence_read_skip_cache;
 } SV;
 
 
@@ -2342,6 +2345,10 @@ public:
   static bool binlog_row_event_extra_data_eq(const uchar* a,
                                              const uchar* b);
 
+  /* Binlog autonomous transaction function */
+  bool begin_autonomous_binlog();
+  bool end_autonomous_binlog();
+
 #ifndef MYSQL_CLIENT
   int binlog_setup_trx_data();
 
@@ -2350,6 +2357,8 @@ public:
   */
   int binlog_write_table_map(TABLE *table, bool is_transactional,
                              bool binlog_rows_query);
+  int autonomous_binlog_write_table_map(TABLE *table, bool is_transactional);
+
   int binlog_write_row(TABLE* table, bool is_transactional,
                        const uchar *new_data,
                        const uchar* extra_row_info);
@@ -2610,7 +2619,97 @@ public:
       */
       all.add_unsafe_rollback_flags(stmt.get_unsafe_rollback_flags());
     }
+
+    void back(struct st_transactions *trans)
+    {
+      memcpy(trans, this, sizeof(*this));
+      memset(this, 0, sizeof(*this));
+      xid_state.xid.null();
+      init_sql_alloc(&mem_root, ALLOC_ROOT_MIN_BLOCK_SIZE, 0);
+    }
+
+    void restore(struct st_transactions *trans)
+    {
+      memcpy(this, trans, sizeof(*this));
+    }
+
+    void reset()
+    {
+      free_root(&mem_root, MYF(0));
+      memset(this, 0, sizeof(*this));
+    }
   } transaction;
+
+  /* autonomous transaction context */
+  struct st_autonomy_context {
+
+    /* autonomous storage engine  */
+    struct st_autonomy_data {
+      /* Storage engine specific thread local data. */
+
+      /* THD binlog cache */
+      void  *binlog_ptr;
+
+      Ha_trx_info ha_binlog_info;
+      /* TODO: Current only one storage engine participate in
+         autonomous transaction, and life time is transaction. */
+
+      /* storage engine trx */
+      void *ha_ptr;
+
+      /* life time: autonomous transaction */
+      Ha_trx_info ha_info;
+
+      void reset()
+      {
+        binlog_ptr= NULL;
+        ha_ptr= NULL;
+        ha_info.reset();
+        ha_binlog_info.reset();
+      };
+      void reset_binlog()
+      {
+        binlog_ptr= NULL;
+        ha_binlog_info.reset();
+      };
+      void reset_ha()
+      {
+        ha_ptr= NULL;
+        ha_info.reset();
+      };
+      void set_binlog(void *ptr)
+      {
+        binlog_ptr= ptr;
+      };
+      void set_ha(void *ptr)
+      {
+        ha_ptr= ptr;
+      }
+    } ha_data;
+
+    /* autonomous transaction */
+    struct st_transactions   ha_trans;
+
+    /* isolation level */
+    ulonglong isolation_level;
+
+    /* For the storage engine. */
+    ulonglong lock_type;
+
+    /* Commit MDL lock */
+    MDL_request mdl_request;
+
+    bool release_mdl;
+    bool binlog_inited;
+    bool ha_inited;
+
+    void reset()
+    {
+      ha_data.reset();
+      ha_trans.reset();
+    }
+  } atm_ctx;
+
   Global_read_lock global_read_lock;
   Field      *dup_field;
 #ifndef __WIN__
@@ -3053,6 +3152,8 @@ public:
                           pos_var ? *pos_var : 0));
     DBUG_VOID_RETURN;
   }
+
+  my_off_t get_trans_pos() { return m_trans_end_pos; }
   /**@}*/
 
 
@@ -4230,6 +4331,9 @@ public:
 
   /* Store lsn for engine when preparing finished. */
   engine_lsn_map* prepared_engine;
+
+  /* If this is a semisync slave connection. */
+  bool semi_sync_slave;
 };
 
 
