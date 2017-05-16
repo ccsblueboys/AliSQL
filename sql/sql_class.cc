@@ -217,7 +217,7 @@ bool foreign_key_prefix(Key *a, Key *b)
 */
 void *thd_get_scheduler_data(THD *thd)
 {
-  return thd->scheduler.data;
+  return thd->event_scheduler.data;
 }
 
 /**
@@ -228,7 +228,7 @@ void *thd_get_scheduler_data(THD *thd)
 */
 void thd_set_scheduler_data(THD *thd, void *data)
 {
-  thd->scheduler.data= data;
+  thd->event_scheduler.data= data;
 }
 
 /**
@@ -240,7 +240,7 @@ void thd_set_scheduler_data(THD *thd, void *data)
 */
 PSI_thread *thd_get_psi(THD *thd)
 {
-  return thd->scheduler.m_psi;
+  return thd->event_scheduler.m_psi;
 }
 
 /**
@@ -263,7 +263,7 @@ ulong thd_get_net_wait_timeout(THD* thd)
 */
 void thd_set_psi(THD *thd, PSI_thread *psi)
 {
-  thd->scheduler.m_psi= psi;
+  thd->event_scheduler.m_psi= psi;
 }
 
 /**
@@ -675,6 +675,33 @@ void *thd_get_ha_data(const THD *thd, const struct handlerton *hton)
   return *thd_ha_data(thd, hton);
 }
 
+/* Autonomous transaction context attr setting */
+extern "C"
+void **thd_atm_ha_data(const THD *thd)
+{
+  return (void **) &thd->atm_ctx.ha_data.ha_ptr;
+}
+extern "C"
+void *thd_get_atm_ha_data(const THD *thd)
+{
+  return *thd_atm_ha_data(thd);
+}
+extern "C"
+void thd_set_atm_ha_data(THD *thd, const void *ha_data)
+{
+  *thd_atm_ha_data(thd)= (void*) ha_data;
+}
+
+extern "C"
+unsigned long thd_get_atm_lock_type(const THD *thd)
+{
+  return (unsigned long)(thd->atm_ctx.lock_type);
+}
+extern "C"
+void thd_set_atm_lock_type(THD *thd, unsigned long lock_type)
+{
+  thd->atm_ctx.lock_type= lock_type;
+}
 
 /**
   Provide a handler data setter to simplify coding
@@ -995,6 +1022,13 @@ THD::THD(bool enable_plugins)
   stmt_arena= this;
   thread_stack= 0;
   catalog= (char*)"std"; // the only catalog we have for now
+
+  /* for threadpool feature */
+  scheduler= thread_scheduler;
+  event_scheduler.data= 0;
+  event_scheduler.m_psi= 0;
+  skip_wait_timeout= false;
+
   main_security_ctx.init();
   security_ctx= &main_security_ctx;
   no_errors= 0;
@@ -1039,8 +1073,8 @@ THD::THD(bool enable_plugins)
 #endif
 #ifndef EMBEDDED_LIBRARY
   mysql_audit_init_thd(this);
-  net.vio=0;
 #endif
+  net.vio=0;
   client_capabilities= 0;                       // minimalistic client
   ull=0;
   system_thread= NON_SYSTEM_THREAD;
@@ -1120,6 +1154,8 @@ THD::THD(bool enable_plugins)
     m_token_array= (unsigned char*) my_malloc(max_digest_length,
                                               MYF(MY_WME));
   }
+
+  atm_ctx.reset();
 }
 
 
@@ -1834,7 +1870,8 @@ void THD::awake(THD::killed_state state_to_set)
         reading the next statement.
       */
 
-      shutdown_active_vio();
+      if (active_vio)
+        vio_cancel(active_vio, SHUT_RDWR);
     }
 #endif
 
@@ -1843,7 +1880,7 @@ void THD::awake(THD::killed_state state_to_set)
 
     /* Send an event to the scheduler that a thread should be killed. */
     if (!slave_thread)
-      MYSQL_CALLBACK(thread_scheduler, post_kill_notification, (this));
+      MYSQL_CALLBACK(scheduler, post_kill_notification, (this));
   }
 
   /* Broadcast a condition to kick the target if it is waiting on it. */
@@ -3782,7 +3819,8 @@ void thd_increment_bytes_sent(ulong length)
 
 void thd_increment_bytes_received(ulong length)
 {
-  current_thd->status_var.bytes_received+= length;
+  if (likely(current_thd != NULL))
+    current_thd->status_var.bytes_received+= length;
 }
 
 
@@ -4395,7 +4433,13 @@ extern "C" void thd_pool_wait_end(MYSQL_THD thd);
 */
 extern "C" void thd_wait_begin(MYSQL_THD thd, int wait_type)
 {
-  MYSQL_CALLBACK(thread_scheduler, thd_wait_begin, (thd, wait_type));
+  if (!thd)
+  {
+    thd= current_thd;
+    if (unlikely(!thd))
+      return;
+  }
+  MYSQL_CALLBACK(thd->scheduler, thd_wait_begin, (thd, wait_type));
 }
 
 /**
@@ -4406,7 +4450,14 @@ extern "C" void thd_wait_begin(MYSQL_THD thd, int wait_type)
 */
 extern "C" void thd_wait_end(MYSQL_THD thd)
 {
-  MYSQL_CALLBACK(thread_scheduler, thd_wait_end, (thd));
+  if (!thd)
+  {
+    thd= current_thd;
+    if (unlikely(!thd))
+      return;
+  }
+
+  MYSQL_CALLBACK(thd->scheduler, thd_wait_end, (thd));
 }
 #else
 extern "C" void thd_wait_begin(MYSQL_THD thd, int wait_type)

@@ -59,6 +59,7 @@
 
 #include "rpl_tblmap.h"
 #include "debug_sync.h"
+#include "semisync_slave.h"
 
 using std::min;
 using std::max;
@@ -2699,8 +2700,21 @@ when it try to get the value of TIME_ZONE global variable from master.";
       mysql_free_result(master_res);
       break;
     }
-    if (mi->master_gtid_mode > gtid_mode + 1 ||
-        gtid_mode > mi->master_gtid_mode + 1)
+    /**
+     * Add opt_anonymout_in_gtid_out_enable to control whether a gtid_mode
+     * check is a must when slave connect to master. If the switch is ON,
+     * gtid_mode check between master node and slave node in replication
+     * is disabled, so that the migration from 5.1 or 5.5 to 5.6 will be
+     * more graceful, since we don't need reboot to switch from
+     * file-position-based replicate protocol to GTID protocol; if the
+     * switch is OFF, gtid_mode is checked.
+     *
+     * This strategy is from booking.com, a detail description is at
+     * http://blog.booking.com/mysql-5.6-gtids-evaluation-and-online-migration.html
+     *
+     */
+    if (!opt_anonymous_in_gtid_out_enable && (mi->master_gtid_mode > gtid_mode + 1 ||
+                                              gtid_mode > mi->master_gtid_mode + 1))
     {
       mi->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
                  "The slave IO thread stops because the master has "
@@ -2844,7 +2858,7 @@ static int write_ignored_events_info_to_relay_log(THD *thd, Master_info *mi)
                                                Rotate_log_event::DUP_NAME);
     if (mi->get_mi_description_event() != NULL)
       ev->checksum_alg= mi->get_mi_description_event()->checksum_alg;
-    
+
     rli->ign_master_log_name_end[0]= 0;
     /* can unlock before writing as slave SQL thd will soon see our Rotate */
     mysql_mutex_unlock(log_lock);
@@ -3503,9 +3517,7 @@ static int request_dump(THD *thd, MYSQL* mysql, Master_info* mi,
   uchar* command_buffer= NULL;
   ushort binlog_flags= 0;
 
-  if (RUN_HOOK(binlog_relay_io,
-               before_request_transmit,
-               (thd, mi, binlog_flags)))
+  if (repl_semisync_slave.requestTransmit(mi))
     goto err;
 
   *suppress_warnings= false;
@@ -4744,10 +4756,11 @@ pthread_handler_t handle_slave_io(void *arg)
   /* This must be called before run any binlog_relay_io hooks */
   my_pthread_setspecific_ptr(RPL_MASTER_INFO, mi);
 
-  if (RUN_HOOK(binlog_relay_io, thread_start, (thd, mi)))
+  if (DBUG_EVALUATE_IF("failed_slave_start", 1, 0)
+      ||repl_semisync_slave.slaveStart(mi))
   {
     mi->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
-               ER(ER_SLAVE_FATAL_ERROR), "Failed to run 'thread_start' hook");
+               ER(ER_SLAVE_FATAL_ERROR), "Failed to call 'slaveStart'");
     goto err;
   }
 
@@ -4942,19 +4955,20 @@ Stopping slave I/O thread due to out-of-memory error from master");
       THD_STAGE_INFO(thd, stage_queueing_master_event_to_the_relay_log);
       event_buf= (const char*)mysql->net.read_pos + 1;
       DBUG_PRINT("info", ("IO thread received event of type %s", Log_event::get_type_str((Log_event_type)event_buf[EVENT_TYPE_OFFSET])));
-      if (RUN_HOOK(binlog_relay_io, after_read_event,
-                   (thd, mi,(const char*)mysql->net.read_pos + 1,
-                    event_len, &event_buf, &event_len)))
+
+      mi->semi_ack= 0;
+      if (repl_semisync_slave.slaveReadSyncHeader((const char*)mysql->net.read_pos + 1,
+                                                  event_len, &(mi->semi_ack), &event_buf,
+                                                  &event_len))
       {
         mi->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
                    ER(ER_SLAVE_FATAL_ERROR),
-                   "Failed to run 'after_read_event' hook");
+                   "Failed to call 'slaveReadSyncHeader'");
         goto err;
       }
 
       /* XXX: 'synced' should be updated by queue_event to indicate
          whether event has been synced to disk */
-      bool synced= 0;
       if (queue_event(mi, event_buf, event_len))
       {
         mi->report(ERROR_LEVEL, ER_SLAVE_RELAY_LOG_WRITE_FAILURE,
@@ -4962,26 +4976,34 @@ Stopping slave I/O thread due to out-of-memory error from master");
                    "could not queue event from master");
         goto err;
       }
-      if (RUN_HOOK(binlog_relay_io, after_queue_event,
-                   (thd, mi, event_buf, event_len, synced)))
+
+      if((mi->semi_ack & SEMI_SYNC_NEED_ACK) &&
+         repl_semisync_slave.slaveReply(mi))
       {
         mi->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
                    ER(ER_SLAVE_FATAL_ERROR),
-                   "Failed to run 'after_queue_event' hook");
+                   "Failed to call 'slaveReply'");
         goto err;
       }
 
-      mysql_mutex_lock(&mi->data_lock);
-      if (flush_master_info(mi, FALSE))
+      /* If rpl_semi_sync_slave_delay_master is enabled, we will flush
+      master info only when ack is needed. This may lead to at least one
+      group transaction delay but affords better performance improvement */
+      if ((!(mi->semi_ack & SEMI_SYNC_SLAVE_DELAY_SYNC)
+           || (mi->semi_ack & (SEMI_SYNC_NEED_ACK))))
       {
-        mi->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
-                   ER(ER_SLAVE_FATAL_ERROR),
-                   "Failed to flush master info.");
+        mysql_mutex_lock(&mi->data_lock);
+        if (DBUG_EVALUATE_IF("failed_flush_master_info", 1, 0)
+            || flush_master_info(mi, FALSE))
+        {
+          mi->report(ERROR_LEVEL, ER_SLAVE_FATAL_ERROR,
+                     ER(ER_SLAVE_FATAL_ERROR),
+                     "Failed to flush master info.");
+          mysql_mutex_unlock(&mi->data_lock);
+          goto err;
+        }
         mysql_mutex_unlock(&mi->data_lock);
-        goto err;
       }
-      mysql_mutex_unlock(&mi->data_lock);
-
       /*
         See if the relay logs take too much space.
         We don't lock mi->rli->log_space_lock here; this dirty read saves time
@@ -5065,7 +5087,7 @@ err:
   // print the current replication position
   sql_print_information("Slave I/O thread exiting, read up to log '%s', position %s",
                   mi->get_io_rpl_log_name(), llstr(mi->get_master_log_pos(), llbuff));
-  (void) RUN_HOOK(binlog_relay_io, thread_stop, (thd, mi));
+  repl_semisync_slave.slaveStop(mi);
   thd->reset_query();
   thd->reset_db(NULL, 0);
   if (mysql)
@@ -8758,7 +8780,7 @@ int reset_slave(THD *thd, Master_info* mi)
     goto err;
   }
 
-  (void) RUN_HOOK(binlog_relay_io, after_reset_slave, (thd, mi));
+  repl_semisync_slave.resetSlave(mi);
 err:
   unlock_slave_threads(mi);
   if (error)

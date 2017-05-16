@@ -306,10 +306,11 @@ UNIV_INTERN
 void
 dict_table_autoinc_initialize(
 /*==========================*/
-	dict_table_t*	table,	/*!< in/out: table */
-	ib_uint64_t	value)	/*!< in: next value to assign to a row */
+	dict_table_t*	table,		/*!< in/out: table */
+	ulonglong	increment,	/*!< in: auto increment value */
+	ib_uint64_t	value)		/*!< in: next value to assign to
+					a row */
 	MY_ATTRIBUTE((nonnull));
-
 /** Store autoinc value when the table is evicted.
 @param[in]	table	table evicted */
 UNIV_INTERN
@@ -342,8 +343,10 @@ void
 dict_table_autoinc_update_if_greater(
 /*=================================*/
 
-	dict_table_t*	table,	/*!< in/out: table */
-	ib_uint64_t	value)	/*!< in: value which was assigned to a row */
+	dict_table_t*	table,		/*!< in/out: table */
+	ulonglong	increment,	/*!< in: auto increment value */
+	ib_uint64_t	value)		/*!< in: value which was assigned
+					to a row */
 	MY_ATTRIBUTE((nonnull));
 /********************************************************************//**
 Release the autoinc lock. */
@@ -389,8 +392,9 @@ void
 dict_table_remove_from_cache_low(
 /*=============================*/
 	dict_table_t*	table,		/*!< in, own: table */
-	ibool		lru_evict);	/*!< in: TRUE if table being evicted
+	ibool		lru_evict,	/*!< in: TRUE if table being evicted
 					to make room in the table LRU list */
+	ibool		autoinc_persistent); /*!< in, own: autoinc_persistent */
 /**********************************************************************//**
 Renames a table object.
 @return	TRUE if success */
@@ -877,6 +881,22 @@ dict_table_is_comp(
 	const dict_table_t*	table)	/*!< in: table */
 	MY_ATTRIBUTE((nonnull, warn_unused_result));
 /********************************************************************//**
+Check whether the table uses the comfort row format.
+@return	TRUE if table uses the comfort row format */
+UNIV_INLINE
+ibool
+dict_table_is_comfort(
+/*==================*/
+	const dict_table_t*	table);	/*!< in: table */
+/********************************************************************//**
+Check whether the index needs rec_comfort format.
+@return	TRUE if the index needs rec_comfort format */
+UNIV_INLINE
+ibool
+dict_index_need_comfort(
+/*====================*/
+	const dict_index_t*	index);	/*!< in: index */
+/********************************************************************//**
 Determine the file format of a table.
 @return	file format version */
 UNIV_INLINE
@@ -1225,6 +1245,14 @@ dict_index_copy_types(
 	ulint			n_fields)	/*!< in: number of
 						field types to copy */
 	MY_ATTRIBUTE((nonnull));
+/*********************************************************************//**
+Copy the column ord_part and max_prefix. */
+UNIV_INLINE
+void
+dict_col_copy_ord_prefix(
+/*=====================*/
+	dict_col_t*		new_col,	/*!< in/out: column */
+	const dict_col_t*	old_col);	/*!< in: column */
 #endif /* !UNIV_HOTBACKUP */
 /*********************************************************************//**
 Gets the field column.

@@ -44,7 +44,8 @@ typedef enum _thd_wait_type_e {
   THD_WAIT_BINLOG= 8,
   THD_WAIT_GROUP_COMMIT= 9,
   THD_WAIT_SYNC= 10,
-  THD_WAIT_LAST= 11
+  THD_WAIT_NET= 11,
+  THD_WAIT_LAST= 12
 } thd_wait_type;
 extern struct thd_wait_service_st {
   void (*thd_wait_begin_func)(void*, int);
@@ -252,6 +253,10 @@ void mysql_query_cache_invalidate4(void* thd,
 void *thd_get_ha_data(const void* thd, const struct handlerton *hton);
 void thd_set_ha_data(void* thd, const struct handlerton *hton,
                      const void *ha_data);
+void *thd_get_atm_ha_data(const void* thd);
+void thd_set_atm_ha_data(void* thd, const void *ha_data);
+unsigned long thd_get_atm_lock_type(const void *thd);
+void thd_set_atm_lock_type(void *thd, unsigned long lock_type);
 #include <mysql/plugin_auth_common.h>
 typedef struct st_plugin_vio_info
 {

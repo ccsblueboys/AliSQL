@@ -1421,6 +1421,13 @@ row_get_prebuilt_insert_row(
 
 	dict_table_copy_types(row, table);
 
+	/* Set table tuple flag if comfort row_format.
+	   But it only affact clust_index. */
+	if (dict_table_is_comfort(table)) {
+		dtuple_set_info_bits(row,
+				     dtuple_get_info_bits(row)
+				     | REC_INFO_REC_COMFORT_FLAG);
+	}
 	ins_node_set_new_row(node, row);
 
 	prebuilt->ins_graph = static_cast<que_fork_t*>(
@@ -4059,7 +4066,7 @@ next_rec:
 
 	/* Reset auto-increment. */
 	dict_table_autoinc_lock(table);
-	dict_table_autoinc_initialize(table, 1);
+	dict_table_autoinc_initialize(table, 1, 1);
 	dict_table_autoinc_unlock(table);
 
 	trx_commit_for_mysql(trx);
@@ -4912,17 +4919,21 @@ dberr_t
 row_drop_database_for_mysql(
 /*========================*/
 	const char*	name,	/*!< in: database name which ends to '/' */
-	trx_t*		trx)	/*!< in: transaction handle */
+	trx_t*		trx,	/*!< in: transaction handle */
+	bool		is_prefix)/*!< in: name is prefix of partition table if true. */
 {
 	dict_table_t*	table;
 	char*		table_name;
 	dberr_t		err	= DB_SUCCESS;
 	ulint		namelen	= strlen(name);
+	ulint		drop_count = 0;
 
 	ut_a(name != NULL);
-	ut_a(name[namelen - 1] == '/');
+	ut_a((name[namelen - 1] == '/')
+	     || (is_prefix && strchr(name, '/') != NULL));
 
-	trx->op_info = "dropping database";
+	if (!is_prefix)
+		trx->op_info = "dropping database";
 
 	trx_set_dict_operation(trx, TRX_DICT_OP_TABLE);
 
@@ -4949,7 +4960,9 @@ loop:
 
 		}
 
-		if (!row_is_mysql_tmp_table_name(table->name)) {
+		drop_count++;
+
+		if (!is_prefix && !row_is_mysql_tmp_table_name(table->name)) {
 			/* There could be orphan temp tables left from
 			interrupted alter table. Leave them, and handle
 			the rest.*/
@@ -5014,7 +5027,8 @@ loop:
 		mem_free(table_name);
 	}
 
-	if (err == DB_SUCCESS) {
+	if (!is_prefix &&
+	    err == DB_SUCCESS) {
 		/* after dropping all tables try to drop all leftover
 		foreign keys in case orphaned ones exist */
 		err = drop_all_foreign_keys_in_db(name, trx);
@@ -5030,6 +5044,9 @@ loop:
 	trx_commit_for_mysql(trx);
 
 	row_mysql_unlock_data_dictionary(trx);
+
+	if (is_prefix && drop_count == 0)
+		err = DB_TABLE_NOT_FOUND;
 
 	trx->op_info = "";
 

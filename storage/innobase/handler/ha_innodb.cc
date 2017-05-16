@@ -38,6 +38,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <sql_acl.h>	// PROCESS_ACL
 #include <debug_sync.h> // DEBUG_SYNC
 #include <my_base.h>	// HA_OPTION_*
+#include <sql_class.h>
 #include <mysys_err.h>
 #include <mysql/innodb_priv.h>
 #include <my_check_opt.h>
@@ -1024,6 +1025,14 @@ innobase_close_cursor_view(
 	THD*		thd,		/*!< in: user thread handle */
 	void*		curview);	/*!< in: Consistent read view to be
 					closed */
+/***************************************//**
+Remove the specified table from InnoDB. */
+static
+void
+innobase_force_drop_table(
+/*=======================*/
+	handlerton*	hton,
+	char*		name);
 /*****************************************************************//**
 Removes all tables in the named database inside InnoDB. */
 static
@@ -3006,6 +3015,7 @@ innobase_init(
 	innobase_hton->close_cursor_read_view = innobase_close_cursor_view;
 	innobase_hton->create = innobase_create_handler;
 	innobase_hton->drop_database = innobase_drop_database;
+	innobase_hton->force_drop_table = innobase_force_drop_table;
 	innobase_hton->panic = innobase_end;
 
 	innobase_hton->start_consistent_snapshot =
@@ -4122,6 +4132,8 @@ ha_innobase::get_row_type() const
 			return(ROW_TYPE_COMPRESSED);
 		case REC_FORMAT_DYNAMIC:
 			return(ROW_TYPE_DYNAMIC);
+		case REC_FORMAT_COMFORT:
+			return(ROW_TYPE_COMFORT);
 		}
 	}
 	ut_ad(0);
@@ -4841,6 +4853,17 @@ ha_innobase::innobase_initialize_autoinc()
 
 			auto_inc = innobase_next_autoinc(
 				read_auto_inc, 1, 1, 0, col_max_value);
+			if (srv_autoinc_persistent) {
+
+				ulonglong	auto_inc_persistent;
+				auto_inc_persistent = btr_root_get_auto_inc(prebuilt->table);
+				/* auto_inc_persistent = 0 when srv_autoinc_persistent=off,
+				then we use SELECT MAX(col_name); */
+				if (auto_inc_persistent > 0) {
+
+					auto_inc = auto_inc_persistent;
+				}
+			}
 
 			break;
 		}
@@ -4875,7 +4898,9 @@ ha_innobase::innobase_initialize_autoinc()
 		}
 	}
 
-	dict_table_autoinc_initialize(prebuilt->table, auto_inc);
+	dict_table_autoinc_initialize(prebuilt->table,
+				      prebuilt->autoinc_increment,
+				      auto_inc);
 }
 
 /*****************************************************************//**
@@ -6646,7 +6671,9 @@ ha_innobase::innobase_reset_autoinc(
 
 	if (error == DB_SUCCESS) {
 
-		dict_table_autoinc_initialize(prebuilt->table, autoinc);
+		dict_table_autoinc_initialize(prebuilt->table,
+					      prebuilt->autoinc_increment,
+					      autoinc);
 
 		dict_table_autoinc_unlock(prebuilt->table);
 	}
@@ -6670,7 +6697,8 @@ ha_innobase::innobase_set_max_autoinc(
 
 	if (error == DB_SUCCESS) {
 
-		dict_table_autoinc_update_if_greater(prebuilt->table, auto_inc);
+		dict_table_autoinc_update_if_greater(prebuilt->table,
+			prebuilt->autoinc_increment, auto_inc);
 
 		dict_table_autoinc_unlock(prebuilt->table);
 	}
@@ -7224,7 +7252,105 @@ calc_row_difference(
 
 	return(DB_SUCCESS);
 }
+/**********************************************************************//**
+Begin InnoDB autonomous transaction.
+@return	error number or 0 */
+UNIV_INTERN
+int
+ha_innobase::begin_autonomous_trans()
+/*=================================*/
+{
+	trx_t*         atm_trx;
+	DBUG_ENTER("ha_innobase::begin_autonomous_trans");
 
+	trx_t*&	parent_trx = thd_to_trx(user_thd);
+	ut_ad(parent_trx == prebuilt->trx);
+
+	/* Backup trx */
+	thd_set_atm_ha_data(user_thd, parent_trx);
+	thd_set_atm_lock_type(user_thd, prebuilt->select_lock_type);
+
+	/* Allocate autonomous trx */
+	atm_trx = innobase_trx_allocate(user_thd);
+	ut_a(!trx_is_started(atm_trx));
+
+	/* Autonomous trx
+	     1. dirty read directly.
+	     2. lock_x mode. */
+	atm_trx->autonomy= true;
+	atm_trx->isolation_level= TRX_ISO_READ_UNCOMMITTED;
+	prebuilt->select_lock_type= LOCK_X;
+	++atm_trx->will_lock;
+
+	/* Overlap current trx */
+	parent_trx = atm_trx;
+	row_update_prebuilt_trx(prebuilt, atm_trx);
+
+	/* Register 2pc as transaction context, ignore statement context. */
+	trans_register_autonomous_ha(user_thd, TRUE, innodb_hton_ptr, false);
+	trx_register_for_2pc(prebuilt->trx);
+
+	DBUG_RETURN(0);
+}
+/**********************************************************************//**
+Restore the parent trx.
+@return	error number or 0 */
+UNIV_INTERN
+int
+ha_innobase::end_autonomous_trans()
+/*===============================*/
+{
+	trx_t*          atm_trx;
+	DBUG_ENTER("ha_innobase::end_autonomous_trans");
+
+	trx_t*& trx = thd_to_trx(user_thd);
+	ut_ad(trx == prebuilt->trx);
+	atm_trx = prebuilt->trx;
+
+	/* Restore trx */
+	trx = (trx_t *)thd_get_atm_ha_data(user_thd);
+	prebuilt->select_lock_type = thd_get_atm_lock_type(user_thd);
+	row_update_prebuilt_trx(prebuilt, trx);
+	ut_ad(thd_to_trx(user_thd) == prebuilt->trx);
+
+	/* Clean up atm trx */
+	trx_rollback_for_mysql(atm_trx);
+	trx_free_for_mysql(atm_trx);
+	DBUG_RETURN(0);
+}
+/**********************************************************************//**
+Updates a row given as a parameter to a new value. Notes that it happened
+within autonomous transaction.
+@return	error number or 0 */
+UNIV_INTERN
+int
+ha_innobase::atm_update_row(
+/*========================*/
+	const uchar*	old_row,	/*!< in: old row in MySQL format */
+	uchar*		new_row)	/*!< in: new row in MySQL format */
+{
+	int            error;
+	dberr_t        db_err;
+	DBUG_ENTER("ha_innobase::atm_update_row");
+	ut_ad(thd_to_trx(user_thd) == prebuilt->trx);
+
+	if (high_level_read_only) {
+		ib_senderrf(ha_thd(), IB_LOG_LEVEL_WARN, ER_READ_ONLY_MODE);
+		DBUG_RETURN(HA_ERR_TABLE_READONLY);
+	}
+	/* Lock table */
+	db_err= row_lock_table_for_mysql(prebuilt, prebuilt->table,
+					 LOCK_X);
+	if (db_err != DB_SUCCESS) {
+		error = convert_error_code_to_mysql(db_err, 0,
+						    user_thd);
+		DBUG_RETURN(error);
+	}
+	build_template(true);
+	error= update_row(old_row, new_row);
+
+	DBUG_RETURN(error);
+}
 /**********************************************************************//**
 Updates a row given as a parameter to a new value. Note that we are given
 whole rows, not just the fields which are updated: this incurs some
@@ -7286,6 +7412,11 @@ ha_innobase::update_row(
 	error = calc_row_difference(uvect, (uchar*) old_row, new_row, table,
 				    upd_buf, upd_buf_size, prebuilt, user_thd);
 
+	/* If comfort table, set update vector rec_comfort flag. */
+	if (dict_table_is_comfort(prebuilt->table)) {
+		upd_set_info_bits(uvect, upd_get_info_bits(uvect)
+						| REC_INFO_REC_COMFORT_FLAG);
+	}
 	if (error != DB_SUCCESS) {
 		goto func_exit;
 	}
@@ -7399,6 +7530,12 @@ ha_innobase::delete_row(
 		row_get_prebuilt_update_vector(prebuilt);
 	}
 
+	/* If comfort table, set update vector rec_comfort flag. */
+	if (dict_table_is_comfort(prebuilt->table)) {
+		upd_set_info_bits(prebuilt->upd_node->update,
+				  upd_get_info_bits(prebuilt->upd_node->update)
+				  | REC_INFO_REC_COMFORT_FLAG);
+	}
 	/* This is a delete */
 
 	prebuilt->upd_node->is_delete = TRUE;
@@ -9120,6 +9257,8 @@ get_row_format_name(
 		return("DEFAULT");
 	case ROW_TYPE_FIXED:
 		return("FIXED");
+	case ROW_TYPE_COMFORT:
+		return("COMFORT");
 	case ROW_TYPE_PAGE:
 	case ROW_TYPE_NOT_USED:
 	default:
@@ -9247,6 +9386,7 @@ create_options_are_invalid(
 		CHECK_ERROR_ROW_TYPE_NEEDS_FILE_PER_TABLE(use_tablespace);
 		CHECK_ERROR_ROW_TYPE_NEEDS_GT_ANTELOPE;
 		break;
+	case ROW_TYPE_COMFORT:
 	case ROW_TYPE_DYNAMIC:
 		CHECK_ERROR_ROW_TYPE_NEEDS_FILE_PER_TABLE(use_tablespace);
 		CHECK_ERROR_ROW_TYPE_NEEDS_GT_ANTELOPE;
@@ -9615,6 +9755,38 @@ index_bad:
 		innodb_row_format = REC_FORMAT_REDUNDANT;
 		break;
 
+	case ROW_TYPE_COMFORT:
+		zip_allowed = FALSE;
+		if (!use_tablespace) {
+			push_warning_printf(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				ER_ILLEGAL_HA_CREATE_OPTION,
+				"InnoDB: ROW_FORMAT=%s requires"
+				" innodb_file_per_table.",
+				get_row_format_name(row_format));
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				ER_ILLEGAL_HA_CREATE_OPTION,
+				"InnoDB: assuming ROW_FORMAT=COMPACT.");
+			innodb_row_format = REC_FORMAT_COMPACT;
+			break;
+		} else if (create_info->options & HA_LEX_CREATE_TMP_TABLE) {
+			push_warning_printf(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				ER_ILLEGAL_HA_CREATE_OPTION,
+				"InnoDB: ROW_FORMAT=%s didn't support"
+				" temporary table.",
+				get_row_format_name(row_format));
+			push_warning(
+				thd, Sql_condition::WARN_LEVEL_WARN,
+				ER_ILLEGAL_HA_CREATE_OPTION,
+				"InnoDB: assuming ROW_FORMAT=COMPACT.");
+			innodb_row_format = REC_FORMAT_COMPACT;
+			break;
+		} else {
+			innodb_row_format = REC_FORMAT_COMFORT;
+			break;
+		}
 	case ROW_TYPE_COMPRESSED:
 	case ROW_TYPE_DYNAMIC:
 		if (!use_tablespace) {
@@ -10016,7 +10188,8 @@ ha_innobase::create(
 		auto_inc_value = create_info->auto_increment_value;
 
 		dict_table_autoinc_lock(innobase_table);
-		dict_table_autoinc_initialize(innobase_table, auto_inc_value);
+		dict_table_autoinc_initialize(innobase_table,
+			create_info->auto_increment_increment, auto_inc_value);
 		dict_table_autoinc_unlock(innobase_table);
 	}
 
@@ -10324,7 +10497,92 @@ ha_innobase::delete_table(
 
 	DBUG_RETURN(convert_error_code_to_mysql(err, 0, NULL));
 }
+/***************************************//**
+Remove the specified table from InnoDB. */
+static
+void
+innobase_force_drop_table(
+/*=======================*/
+	handlerton*	hton,
+	char*		name)
+{
+	trx_t* trx;
+	dberr_t err;
+	char  norm_name[FN_REFLEN];
 
+	if (srv_read_only_mode
+	    || name == NULL
+	    || (strchr(name, '/') == NULL))
+		return; //no cover line
+
+	THD* thd = current_thd;
+	if (thd) {
+		trx_t*	parent_trx = check_trx_exists(thd);
+
+		/* In case MySQL calls this in the middle of a SELECT
+		query, release possible adaptive hash latch to avoid
+		deadlocks of threads */
+		trx_search_latch_release_if_reserved(parent_trx);
+	}
+
+	normalize_table_name(norm_name, name);
+
+	trx = innobase_trx_allocate(thd);
+
+	/* We are doing a DDL operation. */
+	++trx->will_lock;
+	trx->ddl = true;
+
+	/* Drop the table in InnoDB */
+	err = row_drop_table_for_mysql(
+	       norm_name, trx, false);
+
+	if (err == DB_TABLE_NOT_FOUND) {
+		/* Probably a partition table, Check it
+		from system table. For example, suppose we passed
+		test/t1 to this fuction, should also drop tables with
+		prefix `t1#P#` .*/
+		char prefix_name [FN_REFLEN];
+		/* Build the prefix for partition table. */
+		my_snprintf(prefix_name, FN_REFLEN, "%s#P#", norm_name);
+
+		ib_logf(IB_LOG_LEVEL_INFO,
+			"Try to drop table with prefix '%s'",
+			prefix_name);
+
+		trx->op_info = "force drop table";
+
+		err = row_drop_database_for_mysql(prefix_name, trx, true);
+
+		trx->op_info = "";
+
+	}
+
+	log_buffer_flush_to_disk();
+
+	innobase_commit_low(trx);
+
+	trx_free_for_mysql(trx);
+
+	switch(err) {
+	case DB_CANNOT_DROP_CONSTRAINT:
+		ib_logf(IB_LOG_LEVEL_WARN,
+			"Can't drop %s because of foreign key constraint", norm_name);
+		break;
+	case DB_TABLE_NOT_FOUND:
+		ib_logf(IB_LOG_LEVEL_WARN,
+			"Can't find table %s. Maybe it doesn't exist in innodb.", norm_name);
+		break;
+	case DB_SUCCESS:
+		ib_logf(IB_LOG_LEVEL_INFO,
+			"Success to drop %s from innodb.", norm_name);
+		break;
+	default:
+		ib_logf(IB_LOG_LEVEL_WARN, "Some error happened, error code: %d\n", err);
+		break;
+
+	}
+}
 /*****************************************************************//**
 Removes all tables in the named database inside InnoDB. */
 static
@@ -13495,7 +13753,9 @@ ha_innobase::get_auto_increment(
 			current = innobase_next_autoinc(
 				current, 1, increment, 1, col_max_value);
 
-			dict_table_autoinc_initialize(prebuilt->table, current);
+			dict_table_autoinc_initialize(prebuilt->table,
+				prebuilt->autoinc_increment,
+				current);
 
 			*first_value = current;
 		}
@@ -13512,7 +13772,7 @@ ha_innobase::get_auto_increment(
 		} else {
 			/* Update the table autoinc variable */
 			dict_table_autoinc_update_if_greater(
-				prebuilt->table, prebuilt->autoinc_last_value);
+				prebuilt->table, prebuilt->autoinc_increment, prebuilt->autoinc_last_value);
 		}
 	} else {
 		/* This will force write_row() into attempting an update
@@ -14555,7 +14815,7 @@ innodb_internal_table_validate(
 
 		DBUG_EXECUTE_IF("innodb_evict_autoinc_table",
 			mutex_enter(&dict_sys->mutex);
-			dict_table_remove_from_cache_low(user_table, TRUE);
+				dict_table_remove_from_cache_low(user_table, TRUE, TRUE);
 			mutex_exit(&dict_sys->mutex);
 		);
 	}
@@ -16083,6 +16343,18 @@ static MYSQL_SYSVAR_ULONG(flush_log_at_trx_commit, srv_flush_log_at_trx_commit,
   " or 2 (write at commit, flush once per second).",
   NULL, NULL, 1, 0, 2, 0);
 
+/* when autoinc_persistent=on and autoinc_persistent_interval=1 the sever
+   performance degradation less than 1% */
+static MYSQL_SYSVAR_BOOL(autoinc_persistent, srv_autoinc_persistent,
+  PLUGIN_VAR_RQCMDARG,
+  "Innodb table's auto_increment max value whether persist in cluster btr root page (off by default).",
+  NULL, NULL, FALSE);
+
+static MYSQL_SYSVAR_ULONG(autoinc_persistent_interval, srv_n_autoinc_interval,
+  PLUGIN_VAR_RQCMDARG,
+  "The interval of persist max auto increment value (default 1).",
+  NULL, NULL, 1, 1, 10000, 0);
+
 static MYSQL_SYSVAR_STR(flush_method, innobase_file_flush_method,
   PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
   "With which method to flush data.", NULL, NULL, NULL);
@@ -16850,6 +17122,8 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(force_load_corrupted),
   MYSQL_SYSVAR(locks_unsafe_for_binlog),
   MYSQL_SYSVAR(lock_wait_timeout),
+  MYSQL_SYSVAR(autoinc_persistent),
+  MYSQL_SYSVAR(autoinc_persistent_interval),
 #ifdef UNIV_LOG_ARCHIVE
   MYSQL_SYSVAR(log_arch_dir),
   MYSQL_SYSVAR(log_archive),

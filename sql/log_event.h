@@ -94,6 +94,7 @@ int ignored_error_code(int err_code);
 #define LOG_READ_TRUNC  -6
 #define LOG_READ_TOO_LARGE -7
 #define LOG_READ_CHECKSUM_FAILURE -8
+#define LOG_READ_BINLOG_LAST_VALID_POS -9
 
 #define LOG_EVENT_OFFSET 4
 
@@ -1229,7 +1230,6 @@ public:
     @retval LOG_READ_TOO_LARGE  event too large
    */
   static int read_log_event(IO_CACHE* file, String* packet,
-                            mysql_mutex_t* log_lock,
                             uint8 checksum_alg_arg,
                             const char *log_file_name_arg= NULL,
                             bool* is_binlog_active= NULL);
@@ -1517,7 +1517,7 @@ public:
   /**
      @return TRUE  if events carries partitioning data (database names).
   */
-  bool contains_partition_info(bool);
+  bool contains_partition_info(bool, Relay_log_info*);
 
   /*
     @return  the number of updated by the event databases.
@@ -3902,6 +3902,10 @@ public:
   const Table_id& get_table_id() const { return m_table_id; }
   const char *get_table_name() const { return m_tblnam; }
   const char *get_db_name() const    { return m_dbnam; }
+  void set_full_name(char *buf)
+  {
+    sprintf(buf, "%s\1%s", m_dbnam, m_tblnam);
+  }
 
   virtual Log_event_type get_type_code() { return TABLE_MAP_EVENT; }
   virtual bool is_valid() const { return m_memory != NULL; /* we check malloc */ }

@@ -65,6 +65,7 @@ Note: YYTHD is passed as an argument to yyparse(), and subsequently to yylex().
 #include "opt_explain_traditional.h"
 #include "opt_explain_json.h"
 #include "lex_token.h"
+#include "sql_sequence.h"
 
 /* this is to get the bison compilation windows warnings out */
 #ifdef _MSC_VER
@@ -1034,7 +1035,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
   Currently there are 161 shift/reduce conflicts.
   We should not introduce new conflicts any more.
 */
-%expect 163
+%expect 168
 
 /*
    Comments for TOKENS.
@@ -1126,6 +1127,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  COLUMN_SYM                    /* SQL-2003-R */
 %token  COLUMN_FORMAT_SYM
 %token  COLUMN_NAME_SYM               /* SQL-2003-N */
+%token  COMFORT_SYM
 %token  COMMENT_SYM
 %token  COMMITTED_SYM                 /* SQL-2003-N */
 %token  COMMIT_SYM                    /* SQL-2003-R */
@@ -1155,6 +1157,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  CURSOR_SYM                    /* SQL-2003-R */
 %token  CURSOR_NAME_SYM               /* SQL-2003-N */
 %token  CURTIME                       /* MYSQL-FUNC */
+%token  CYCLE_SYM
 %token  DATABASE
 %token  DATABASES
 %token  DATAFILE_SYM
@@ -1218,6 +1221,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  EVERY_SYM                     /* SQL-2003-N */
 %token  EXCHANGE_SYM
 %token  EXECUTE_SYM                   /* SQL-2003-R */
+%token  EXECUTED_GTID_SET
 %token  EXISTS                        /* SQL-2003-R */
 %token  EXIT_SYM
 %token  EXPANSION_SYM
@@ -1276,6 +1280,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  IGNORE_SYM
 %token  IGNORE_SERVER_IDS_SYM
 %token  IMPORT
+%token  INCREMENT_SYM
 %token  INDEXES
 %token  INDEX_SYM
 %token  INFILE
@@ -1378,6 +1383,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  MINUTE_MICROSECOND_SYM
 %token  MINUTE_SECOND_SYM
 %token  MINUTE_SYM                    /* SQL-2003-R */
+%token  MINVALUE_SYM
 %token  MIN_ROWS
 %token  MIN_SYM                       /* SQL-2003-N */
 %token  MODE_SYM
@@ -1401,6 +1407,8 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  NEG
 %token  NEW_SYM                       /* SQL-2003-R */
 %token  NEXT_SYM                      /* SQL-2003-N */
+%token  NOCACHE_SYM
+%token  NOCYCLE_SYM
 %token  NODEGROUP_SYM
 %token  NONE_SYM                      /* SQL-2003-R */
 %token  NOT2_SYM
@@ -1525,6 +1533,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
 %token  SELECT_SYM                    /* SQL-2003-R */
 %token  SENSITIVE_SYM                 /* FUTURE-USE */
 %token  SEPARATOR_SYM
+%token  SEQUENCE_SYM
 %token  SERIALIZABLE_SYM              /* SQL-2003-N */
 %token  SERIAL_SYM
 %token  SESSION_SYM                   /* SQL-2003-N */
@@ -1735,7 +1744,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, ulong *yystacksize);
         opt_natural_language_mode opt_query_expansion
         opt_ev_status opt_ev_on_completion ev_on_completion opt_ev_comment
         ev_alter_on_schedule_completion opt_ev_rename_to opt_ev_sql_stmt
-        trg_action_time trg_event
+        trg_action_time trg_event force_drop
 
 /*
   Bit field of MYSQL_START_TRANS_OPT_* flags.
@@ -2449,6 +2458,57 @@ create:
             }
             create_table_set_open_action_and_adjust_tables(lex);
           }
+        | CREATE SEQUENCE_SYM opt_if_not_exists table_ident
+        {
+          THD *thd= YYTHD;
+          LEX *lex= thd->lex;
+          lex->sql_command= SQLCOM_CREATE_TABLE;
+
+          LEX_STRING sequence_name={C_STRING_WITH_LEN("sequence")};
+          if (!plugin_is_ready(&sequence_name, MYSQL_STORAGE_ENGINE_PLUGIN))
+          {
+            my_error(ER_FEATURE_DISABLED, MYF(0), "sequence",
+                        "--with-plugin-sequence");
+            MYSQL_YYABORT;
+          }
+          if (!lex->select_lex.add_table_to_list(thd, $4, NULL,
+                                                 TL_OPTION_UPDATING,
+                                                 TL_WRITE, MDL_EXCLUSIVE))
+            MYSQL_YYABORT;
+
+              /*
+                For CREATE TABLE, an non-existing table is not an error.
+                Instruct open_tables() to just take an MDL lock if the
+                table does not exist.
+              */
+            lex->query_tables->open_strategy= TABLE_LIST::OPEN_IF_EXISTS;
+            lex->alter_info.reset();
+            lex->col_list.empty();
+            lex->change=NullS;
+            memset((char*) &lex->create_info, 0, sizeof(lex->create_info));
+            lex->create_info.options=$3;
+            lex->create_info.default_table_charset= NULL;
+
+            lex->name.str= 0;
+            lex->name.length= 0;
+            lex->create_last_non_select_table= lex->last_table();
+            lex->seq_create_info= new (thd->mem_root)
+                                      Sequence_create_info();
+            lex->native_create_sequence= true;
+        }
+        opt_sequence
+          {
+            Lex->native_create_sequence= true;
+          }
+        create2
+          {
+            THD *thd= YYTHD;
+            LEX *lex= thd->lex;
+            lex->current_select= &lex->select_lex;
+            lex->create_info.used_fields&= ~HA_CREATE_USED_ENGINE;
+            if (lex->alter_info.create_list.elements > 0)
+              lex->native_create_sequence= false;
+          }
         | CREATE opt_unique_combo_clustering INDEX_SYM ident key_alg ON table_ident
           {
             if (add_create_index_prepare(Lex, $7))
@@ -2522,6 +2582,51 @@ create:
         | CREATE server_def
           {
             Lex->sql_command= SQLCOM_CREATE_SERVER;
+          }
+        ;
+
+opt_sequence:
+         /* empty */ { }
+        | sequence_defs
+        ;
+
+sequence_defs:
+          sequence_def
+        | sequence_defs sequence_def
+        ;
+
+sequence_def:
+        MINVALUE_SYM ulong_num
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_MINVALUE, $2);
+          }
+        | MAX_VALUE_SYM ulong_num
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_MAXVALUE, $2);
+          }
+        | START_SYM WITH ulong_num
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_START, $3);
+          }
+        | INCREMENT_SYM BY ulong_num
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_INCREMENT, $3);
+          }
+        | CACHE_SYM ulong_num
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_CACHE, $2);
+          }
+        | NOCACHE_SYM
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_CACHE, 0);
+          }
+        | CYCLE_SYM
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_CYCLE, 1);
+          }
+        | NOCYCLE_SYM
+          {
+            Lex->seq_create_info->init_value(FIELD_NUM_CYCLE, 0);
           }
         ;
 
@@ -6288,6 +6393,7 @@ row_types:
         | TOKU_LZMA_SYM         { $$= ROW_TYPE_TOKU_LZMA; }
         | TOKU_FAST_SYM         { $$= ROW_TYPE_TOKU_FAST; }
         | TOKU_SMALL_SYM        { $$= ROW_TYPE_TOKU_SMALL; }
+        | COMFORT_SYM    { $$= ROW_TYPE_COMFORT; }
         ;
 
 merge_insert_types:
@@ -7653,8 +7759,9 @@ alter_commands:
   will be longer.
 */
         | add_partition_rule
-        | DROP PARTITION_SYM alt_part_name_list
+        | DROP PARTITION_SYM force_drop alt_part_name_list
           {
+            Lex->force_drop_table= $3;
             Lex->alter_info.flags|= Alter_info::ALTER_DROP_PARTITION;
           }
         | REBUILD_SYM PARTITION_SYM opt_no_write_to_binlog
@@ -8771,6 +8878,20 @@ select_from:
              and DUAL is system table without fields.
              Is "SELECT 1 FROM DUAL" any better than "SELECT 1" ?
           Hmmm :) */
+        | FOR_SYM table_ident opt_table_alias
+          {
+            if (!(Select->add_table_to_list(YYTHD, $2, $3,
+                                                0,
+                                                YYPS->m_lock_type,
+                                                YYPS->m_mdl_type,
+                                                NULL, NULL, NULL,
+                                                true)))
+              MYSQL_YYABORT;
+
+            Select->context.table_list=
+              Select->context.first_name_resolution_table=
+                Select->table_list.first;
+          }
         ;
 
 select_options:
@@ -11849,20 +11970,33 @@ do:
 */
 
 drop:
-          DROP opt_temporary table_or_tables if_exists
+          DROP opt_temporary table_or_tables if_exists force_drop
           {
             LEX *lex=Lex;
             lex->sql_command = SQLCOM_DROP_TABLE;
             lex->drop_temporary= $2;
             lex->drop_if_exists= $4;
+            lex->force_drop_table= $5;
             YYPS->m_lock_type= TL_UNLOCK;
             YYPS->m_mdl_type= MDL_EXCLUSIVE;
           }
           table_list opt_wait opt_restrict
           {
             LEX *lex= Lex;
-            lex->wait_time= $7;
+            lex->wait_time= $8;
           }
+
+        | DROP SEQUENCE_SYM
+          {
+            LEX *lex= Lex;
+            lex->sql_command= SQLCOM_DROP_TABLE;
+            lex->drop_temporary= 0;
+            lex->drop_if_exists= 0;
+            YYPS->m_lock_type= TL_UNLOCK;
+            YYPS->m_mdl_type= MDL_EXCLUSIVE;
+          }
+          table_list
+          {}
         | DROP INDEX_SYM ident ON table_ident opt_wait {}
           {
             LEX *lex=Lex;
@@ -12036,6 +12170,15 @@ table_alias_ref:
 if_exists:
           /* empty */ { $$= 0; }
         | IF EXISTS { $$= 1; }
+        ;
+
+force_drop:
+          /* empty */ { $$= 0; }
+        | FORCE_SYM
+          {
+            $$= 1;
+            Lex->skip_force_pos= YYLIP->get_tok_start() - YYTHD->query();
+          }
         ;
 
 opt_temporary:
@@ -12768,6 +12911,14 @@ show_param:
             if (!lex->select_lex.add_table_to_list(YYTHD, $3, NULL, 0))
               MYSQL_YYABORT;
             lex->only_view= 1;
+          }
+        | CREATE SEQUENCE_SYM table_ident
+          {
+            LEX *lex= Lex;
+            lex->sql_command = SQLCOM_SHOW_CREATE;
+            if (!lex->select_lex.add_table_to_list(YYTHD, $3, NULL, 0))
+              MYSQL_YYABORT;
+            lex->only_sequence= 1;
           }
         | MASTER_SYM STATUS_SYM
           {
@@ -14303,6 +14454,7 @@ keyword_sp:
         | COLUMN_NAME_SYM          {}
         | COLUMN_FORMAT_SYM        {}
         | COLUMNS                  {}
+        | COMFORT_SYM              {}
         | COMMITTED_SYM            {}
         | COMPACT_SYM              {}
         | COMPLETION_SYM           {}
@@ -14322,6 +14474,7 @@ keyword_sp:
         */
         | CURRENT_SYM              {}
         | CURSOR_NAME_SYM          {}
+        | CYCLE_SYM                {}
         | DATA_SYM                 {}
         | DATAFILE_SYM             {}
         | DATETIME                 {}
@@ -14374,6 +14527,7 @@ keyword_sp:
         | HOUR_SYM                 {}
         | IDENTIFIED_SYM           {}
         | IGNORE_SERVER_IDS_SYM    {}
+        | INCREMENT_SYM            {}
         | INVOKER_SYM              {}
         | IMPORT                   {}
         | INDEXES                  {}
@@ -14428,6 +14582,7 @@ keyword_sp:
         | MICROSECOND_SYM          {}
         | MIGRATE_SYM              {}
         | MINUTE_SYM               {}
+        | MINVALUE_SYM             {}
         | MIN_ROWS                 {}
         | MODIFY_SYM               {}
         | MODE_SYM                 {}
@@ -14444,6 +14599,8 @@ keyword_sp:
         | NDBCLUSTER_SYM           {}
         | NEXT_SYM                 {}
         | NEW_SYM                  {}
+        | NOCACHE_SYM              {}
+        | NOCYCLE_SYM              {}
         | NO_WAIT_SYM              {}
         | NODEGROUP_SYM            {}
         | NONE_SYM                 {}
@@ -14506,6 +14663,7 @@ keyword_sp:
         | SCHEDULE_SYM             {}
         | SCHEMA_NAME_SYM          {}
         | SECOND_SYM               {}
+        | SEQUENCE_SYM             {}
         | SERIAL_SYM               {}
         | SERIALIZABLE_SYM         {}
         | SESSION_SYM              {}
@@ -14626,6 +14784,13 @@ start_option_value_list:
           {
             if (sp_create_assignment_instr(YYTHD, YY_TOKEN_END))
               MYSQL_YYABORT;
+          }
+        | EXECUTED_GTID_SET TEXT_STRING_sys
+          {
+            THD *thd= YYTHD;
+            LEX *lex= thd->lex;
+            lex->sql_command= SQLCOM_SET_EXECUTED_GTID_SET;
+            lex->add_executed_gtid_set_string= $2.str;
           }
         | option_type
           {

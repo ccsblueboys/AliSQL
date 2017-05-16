@@ -222,7 +222,7 @@ void kill_blocked_pthreads();
 void refresh_status(THD *thd);
 bool is_secure_file_path(char *path);
 bool is_mysql_datadir_path(const char *path);
-void dec_connection_count();
+void dec_connection_count(THD *thd);
 
 // These are needed for unit testing.
 void set_remaining_args(int argc, char **argv);
@@ -417,6 +417,7 @@ extern HASH global_table_stats;
 extern HASH global_index_stats;
 extern const char *opt_date_time_formats[];
 extern handlerton *partition_hton;
+extern handlerton *sequence_hton;
 extern handlerton *myisam_hton;
 extern handlerton *heap_hton;
 extern uint opt_server_id_bits;
@@ -454,6 +455,7 @@ extern ulong log_warnings;
 extern uint host_cache_size;
 void init_sql_statement_names();
 extern my_bool opt_rds_allow_unsafe_stmt_with_gtid;
+extern ulong slave_pr_mode_options;
 
 
 extern HASH ic_gather_hash;
@@ -484,6 +486,8 @@ extern PSI_mutex_key key_BINLOG_LOCK_index;
 extern PSI_mutex_key key_BINLOG_LOCK_log;
 extern PSI_mutex_key key_BINLOG_LOCK_sync;
 extern PSI_mutex_key key_BINLOG_LOCK_sync_queue;
+extern PSI_mutex_key key_BINLOG_LOCK_semisync;
+extern PSI_mutex_key key_BINLOG_LOCK_semisync_queue;
 extern PSI_mutex_key key_BINLOG_LOCK_xids;
 extern PSI_mutex_key
   key_delayed_insert_mutex, key_hash_filo_lock, key_LOCK_active_mi,
@@ -497,7 +501,7 @@ extern PSI_mutex_key
   key_LOCK_slave_net_timeout,
   key_LOCK_server_started, key_LOCK_status,
   key_LOCK_table_share, key_LOCK_thd_data,
-  key_LOCK_user_conn, key_LOCK_uuid_generator, key_LOG_LOCK_log,
+  key_LOCK_user_conn, key_LOCK_uuid_generator, key_LOG_LOCK_log,key_BINLOG_LOCK_binlog_end_pos,
   key_master_info_data_lock, key_master_info_run_lock,
   key_master_info_sleep_lock,
   key_mutex_slave_reporting_capability_err_lock, key_relay_log_info_data_lock,
@@ -515,12 +519,15 @@ extern PSI_mutex_key key_RELAYLOG_LOCK_done;
 extern PSI_mutex_key key_RELAYLOG_LOCK_flush_queue;
 extern PSI_mutex_key key_RELAYLOG_LOCK_index;
 extern PSI_mutex_key key_RELAYLOG_LOCK_log;
+extern PSI_mutex_key key_RELAYLOG_LOCK_binlog_end_pos;
 extern PSI_mutex_key key_RELAYLOG_LOCK_sync;
 extern PSI_mutex_key key_RELAYLOG_LOCK_sync_queue;
 extern PSI_mutex_key key_RELAYLOG_LOCK_xids;
 extern PSI_mutex_key key_LOCK_sql_rand;
 extern PSI_mutex_key key_gtid_ensure_index_mutex;
 extern PSI_mutex_key key_LOCK_thread_created;
+
+extern PSI_mutex_key key_ss_mutex_LOCK_binlog_, key_ss_mutex_Ack_receiver_mutex;
 
 extern PSI_rwlock_key key_rwlock_LOCK_grant, key_rwlock_LOCK_logger,
   key_rwlock_LOCK_sys_init_connect, key_rwlock_LOCK_sys_init_slave,
@@ -553,9 +560,11 @@ extern PSI_cond_key key_BINLOG_prep_xids_cond;
 extern PSI_cond_key key_RELAYLOG_prep_xids_cond;
 extern PSI_cond_key key_gtid_ensure_index_cond;
 
+extern PSI_cond_key key_ss_cond_COND_binlog_send_, key_ss_cond_Ack_receiver_cond;
+
 extern PSI_thread_key key_thread_bootstrap, key_thread_delayed_insert,
   key_thread_handle_manager, key_thread_kill_server, key_thread_main,
-  key_thread_one_connection, key_thread_signal_hand;
+  key_thread_one_connection, key_thread_signal_hand, key_ss_thread_Ack_receiver_thread;
 
 #ifdef HAVE_MMAP
 extern PSI_file_key key_file_map;
@@ -682,6 +691,9 @@ extern PSI_stage_info stage_slave_waiting_worker_to_free_events;
 extern PSI_stage_info stage_slave_waiting_worker_queue;
 extern PSI_stage_info stage_slave_waiting_event_from_coordinator;
 extern PSI_stage_info stage_slave_waiting_workers_to_exit;
+extern PSI_stage_info stage_waiting_for_semi_sync_ack_from_slave;
+extern PSI_stage_info stage_waiting_for_semi_sync_slave;
+extern PSI_stage_info stage_reading_semi_sync_ack;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
 /**
   Statement instrumentation keys (sql).
@@ -900,6 +912,14 @@ extern "C" void unireg_abort(int exit_code) MY_ATTRIBUTE((noreturn));
 extern "C" void unireg_clear(int exit_code);
 #define unireg_abort(exit_code) do { unireg_clear(exit_code); DBUG_RETURN(exit_code); } while(0)
 #endif
+
+
+extern ulong thread_created;
+extern uint mysqld_extra_port;
+extern uint extra_connection_count;
+extern ulong extra_max_connections;
+
+extern scheduler_functions *thread_scheduler, *extra_thread_scheduler;
 
 inline void table_case_convert(char * name, uint length)
 {

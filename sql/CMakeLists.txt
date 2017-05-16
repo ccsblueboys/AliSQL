@@ -107,6 +107,10 @@ SET(SQL_SHARED_SOURCES
   scheduler.cc 
   set_var.cc 
   signal_handler.cc
+  semisync.cc
+  semisync_master.cc
+  semisync_slave.cc
+  semisync_master_ack_receiver.cc
   sp.cc
   sp_cache.cc
   sp_head.cc
@@ -182,9 +186,12 @@ SET(SQL_SHARED_SOURCES
   table_cache.cc
   thr_malloc.cc 
   transaction.cc
+  threadpool_common.cc
   tztime.cc
   uniques.cc
   unireg.cc
+  sql_sequence.cc
+  ha_sequence.cc
 )
 
 SET(SQL_EXPORTED_SOURCES ${SQL_SHARED_SOURCES} PARENT_SCOPE)
@@ -211,6 +218,13 @@ SET(SQL_SOURCE
   sql_client.cc
   )
 
+IF(WIN32)
+  SET(SQL_SOURCE ${SQL_SOURCE} threadpool_win.cc)
+ELSE()
+  SET(SQL_SOURCE ${SQL_SOURCE} threadpool_unix.cc)
+ENDIF()
+
+
 IF (WIN32 AND OPENSSL_APPLINK_C)
   SET_SOURCE_FILES_PROPERTIES(
     ../sql-common/client_authentication.cc
@@ -218,7 +232,14 @@ IF (WIN32 AND OPENSSL_APPLINK_C)
   )
 ENDIF()
 
-MYSQL_ADD_PLUGIN(partition ha_partition.cc STORAGE_ENGINE DEFAULT STATIC_ONLY
+MYSQL_ADD_PLUGIN(partition
+    ha_partition.cc STORAGE_ENGINE DEFAULT STATIC_ONLY MODULE_OUTPUT_NAME
+    "partition"
+RECOMPILE_FOR_EMBEDDED)
+
+MYSQL_ADD_PLUGIN(sequence
+    ha_sequence.cc STORAGE_ENGINE MANDATORY STATIC_ONLY MODULE_OUTPUT_NAME
+    "sequence"
 RECOMPILE_FOR_EMBEDDED)
 
 ADD_LIBRARY(sql STATIC ${SQL_SOURCE})

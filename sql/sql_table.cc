@@ -2048,6 +2048,7 @@ int write_bin_log(THD *thd, bool clear_error,
                   char const *query, ulong query_length, bool is_trans)
 {
   int error= 0;
+  char *new_query= NULL;
   if (mysql_bin_log.is_open())
   {
     int errcode= 0;
@@ -2055,8 +2056,33 @@ int write_bin_log(THD *thd, bool clear_error,
       thd->clear_error();
     else
       errcode= query_error_code(thd, TRUE);
+
+    /* Rewrite the query to skip `FORCE` if this is a force drop command. */
+    if (thd->lex->force_drop_table
+        && thd->lex->skip_force_pos)
+    {
+        new_query= (char *)alloc_root(thd->mem_root, query_length);
+        int skip_pos= thd->lex->skip_force_pos;
+
+        if (new_query)
+        {
+          /* Init the buffer. */
+          memset(new_query, '\0', query_length);
+          /* Copy the query string before 'FORCE'. */
+          memcpy(new_query, query, skip_pos);
+          /* Copy the query string after 'FORCE'. */
+          memcpy(new_query+skip_pos,
+              query + (skip_pos + 6),
+              query_length - (skip_pos + 6));
+
+          /* We need to skip 'FORCE' + ' '. */
+          query_length-= 6;
+          DBUG_ASSERT(query_length == strlen(new_query));
+        }
+    }
+
     error= thd->binlog_query(THD::STMT_QUERY_TYPE,
-                             query, query_length, is_trans, FALSE, FALSE,
+                             new_query ? new_query : query, query_length, is_trans, FALSE, FALSE,
                              errcode);
   }
   return error;
@@ -2261,6 +2287,7 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
   bool non_tmp_table_deleted= 0;
   bool have_nonexistent_tmp_table= 0;
   bool is_drop_tmp_if_exists_with_no_defaultdb= 0;
+  bool force_drop_table= (thd->lex && thd->lex->force_drop_table);
   String built_query;
   String built_trans_tmp_query, built_non_trans_tmp_query;
   String nonexistent_tmp_tables;
@@ -2575,6 +2602,25 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
         goto err;
       }
 
+      if (force_drop_table
+          && !foreign_key_error)
+      {
+        char* end;
+        *(end= path + path_length - reg_ext_length)= '\0';
+
+        /* Check if table exists in engine layer and try to delete it.*/
+        ha_force_drop_table(path);
+
+        /* Check if .par file exists. */
+        char buff[FN_REFLEN];
+        fn_format(buff, path, "", ".par", MY_APPEND_EXT);
+        if (!my_access(buff,F_OK))
+        {
+          sql_print_information("File %s exists, delete it!", buff);
+          my_delete_with_symlink(buff, MYF(MY_WME));
+        }
+      }
+
       if (wrong_tables.length())
         wrong_tables.append(',');
 
@@ -2603,8 +2649,13 @@ err:
   if (wrong_tables.length())
   {
     if (!foreign_key_error)
+    {
+      if (force_drop_table)
+        wrong_tables.append("'. Force engine layer to clean these tables.");
+
       my_printf_error(ER_BAD_TABLE_ERROR, ER(ER_BAD_TABLE_ERROR), MYF(0),
                       wrong_tables.c_ptr());
+    }
     else
       my_message(ER_ROW_IS_REFERENCED, ER(ER_ROW_IS_REFERENCED), MYF(0));
     error= 1;
@@ -4847,6 +4898,23 @@ bool create_table_impl(THD *thd,
   }
 #endif
 
+  /* Change the table engine to sequence engine. */
+  if (thd->lex->seq_create_info)
+  {
+    Sequence_create_info *seq_create_info= thd->lex->seq_create_info;
+
+    DBUG_ASSERT(thd->lex->sql_command == SQLCOM_CREATE_TABLE);
+    DBUG_ASSERT(seq_create_info->base_db_type == create_info->db_type);
+    DBUG_ASSERT(create_info->db_type != sequence_hton);
+
+    create_info->db_type= sequence_hton;
+    delete file;
+
+    if (!(file= get_ha_sequence(seq_create_info)))
+    {
+      DBUG_RETURN(TRUE);
+    }
+  }
   if (mysql_prepare_create_table(thd, create_info, alter_info,
                                  internal_tmp_table,
                                  &db_options, file,
@@ -5444,6 +5512,7 @@ bool mysql_create_like_table(THD* thd, TABLE_LIST* table, TABLE_LIST* src_table,
   local_create_info.options|= create_info->options & HA_LEX_CREATE_TMP_TABLE;
   /* Reset auto-increment counter for the new table. */
   local_create_info.auto_increment_value= 0;
+  local_create_info.auto_increment_increment= thd->variables.auto_increment_increment;
   /*
     Do not inherit values of DATA and INDEX DIRECTORY options from
     the original table. This is documented behavior.
@@ -5765,6 +5834,7 @@ static bool fill_alter_inplace_info(THD *thd,
   KEY_PART_INFO *end;
   uint candidate_key_count= 0;
   Alter_info *alter_info= ha_alter_info->alter_info;
+  bool comfort_add_column= false;
   DBUG_ENTER("fill_alter_inplace_info");
 
   /* Allocate result buffers. */
@@ -5838,9 +5908,11 @@ static bool fill_alter_inplace_info(THD *thd,
   */
   for (f_ptr= table->field; (field= *f_ptr); f_ptr++)
   {
-    /* Clear marker for renamed or dropped field
+    /* Clear marker for renamed, added or dropped field
     which we are going to set later. */
-    field->flags&= ~(FIELD_IS_RENAMED | FIELD_IS_DROPPED);
+
+    /* For the safety although old field is never added again. */
+    field->flags&= ~(FIELD_IS_ADDED | FIELD_IS_RENAMED | FIELD_IS_DROPPED);
 
     /* Use transformed info to evaluate flags for storage engine. */
     uint new_field_index= 0;
@@ -5954,7 +6026,6 @@ static bool fill_alter_inplace_info(THD *thd,
     }
   }
 
-#ifndef DBUG_OFF
   new_field_it.init(alter_info->create_list);
   while ((new_field= new_field_it++))
   {
@@ -5965,10 +6036,10 @@ static bool fill_alter_inplace_info(THD *thd,
         Again corresponding storage engine flag should be already set.
       */
       DBUG_ASSERT(ha_alter_info->handler_flags & Alter_inplace_info::ADD_COLUMN);
-      break;
+
+      new_field->flags|= FIELD_IS_ADDED;
     }
   }
-#endif /* DBUG_OFF */
 
   /*
     Go through keys and check if the original ones are compatible
@@ -6170,6 +6241,26 @@ static bool fill_alter_inplace_info(THD *thd,
       ha_alter_info->handler_flags|= Alter_inplace_info::ADD_INDEX;
   }
 
+  /** Only last nullable and no default value columns can be added
+      comfortably for comfort row_format table.
+  */
+  if (table->s->row_type == ROW_TYPE_COMFORT &&
+      ha_alter_info->handler_flags == Alter_inplace_info::ADD_COLUMN)
+  {
+    comfort_add_column= true;
+    new_field_it.init(alter_info->create_list);
+    while ((new_field= new_field_it++))
+    {
+      if (!new_field->field
+          && (!f_maybe_null(new_field->pack_flag)
+              || new_field->def))
+        comfort_add_column = false;
+    }
+  }
+
+  if (comfort_add_column)
+    ha_alter_info->handler_flags|= Alter_inplace_info::ADD_COLUMN_FOR_COMFORT;
+
   DBUG_RETURN(false);
 }
 
@@ -6189,6 +6280,9 @@ static void update_altered_table(const Alter_inplace_info &ha_alter_info,
   uint field_idx, add_key_idx;
   KEY *key;
   KEY_PART_INFO *end, *key_part;
+  Alter_info *alter_info= ha_alter_info.alter_info;
+  Create_field *cfield;
+  List_iterator_fast<Create_field> cfield_it;
 
   /*
     Clear marker for all fields, as we are going to set it only
@@ -6210,6 +6304,19 @@ static void update_altered_table(const Alter_inplace_info &ha_alter_info,
     end= key->key_part + key->user_defined_key_parts;
     for (key_part= key->key_part; key_part < end; key_part++)
       altered_table->field[key_part->fieldnr]->flags|= FIELD_IN_ADD_INDEX;
+  }
+
+  /* Mark the added fields. */
+  field_idx= 0;
+  cfield_it.init(alter_info->create_list);
+  while ((cfield= cfield_it++))
+  {
+     if (cfield->flags & FIELD_IS_ADDED)
+     {
+       DBUG_ASSERT(!cfield->field);
+       altered_table->field[field_idx]->flags|= FIELD_IS_ADDED;
+     }
+     field_idx++;
   }
 }
 
@@ -6706,6 +6813,10 @@ static bool mysql_inplace_alter_table(THD *thd,
     goto rollback;
   }
 
+  DBUG_EXECUTE_IF("alter_table_sleep_for_online",
+                  {
+                    sleep(10);
+                  });
   // Upgrade to EXCLUSIVE before commit.
   if (wait_while_table_is_used(thd, table, HA_EXTRA_PREPARE_FOR_RENAME))
     goto rollback;
@@ -7055,6 +7166,7 @@ mysql_prepare_alter_table(THD *thd, TABLE *table,
     /* Table has an autoincrement, copy value to new table */
     table->file->info(HA_STATUS_AUTO);
     create_info->auto_increment_value= table->file->stats.auto_increment_value;
+    create_info->auto_increment_increment= thd->variables.auto_increment_increment;
   }
   if (!(used_fields & HA_CREATE_USED_KEY_BLOCK_SIZE))
     create_info->key_block_size= table->s->key_block_size;
@@ -7099,6 +7211,7 @@ mysql_prepare_alter_table(THD *thd, TABLE *table,
 	    !(used_fields & HA_CREATE_USED_AUTO))
 	{
 	  create_info->auto_increment_value=0;
+          create_info->auto_increment_increment= thd->variables.auto_increment_increment;
 	  create_info->used_fields|=HA_CREATE_USED_AUTO;
 	}
 	break;
@@ -9504,6 +9617,16 @@ static bool check_engine(THD *thd, const char *db_name,
       DBUG_RETURN(true);
     }
     *new_engine= myisam_hton;
+  }
+
+  /* Refuse the sequence engine as the table engine. */
+  if (*new_engine == sequence_hton
+      && !thd->lex->seq_create_info)
+  {
+    my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0),
+               ha_resolve_storage_engine_name(*new_engine), "SEQUENCE");
+    *new_engine= NULL;
+    DBUG_RETURN(true);
   }
 
   /*

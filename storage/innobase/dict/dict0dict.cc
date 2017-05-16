@@ -216,6 +216,14 @@ ibool
 dict_lru_validate(void);
 /*===================*/
 /**********************************************************************//**
+Validate the index n_null_arr.
+@return TRUE if valid  */
+static
+ibool
+dict_index_validate(
+/*================*/
+	const dict_index_t*	index);		/*!< in: index */
+/**********************************************************************//**
 Check if table is in the dictionary table LRU list.
 @return TRUE if table found */
 static
@@ -705,12 +713,28 @@ UNIV_INTERN
 void
 dict_table_autoinc_initialize(
 /*==========================*/
-	dict_table_t*	table,	/*!< in/out: table */
-	ib_uint64_t	value)	/*!< in: next value to assign to a row */
+	dict_table_t*	table,		/*!< in/out: table */
+	ulonglong	increment,	/*!< in: auto increment value */
+	ib_uint64_t	value)		/*!< in: next value to assign to a row */
 {
 	ut_ad(dict_table_autoinc_own(table));
 
 	table->autoinc = value;
+	table->old_autoinc = table->autoinc;
+	if (dict_table_is_discarded(table)) {
+
+		return;
+	}
+
+	if (srv_autoinc_persistent) {
+
+		btr_root_set_auto_inc(table,
+			(value + (srv_n_autoinc_interval - 1) * increment));
+	} else {
+
+		/* init value 0 when srv_autoinc_persistent is off */
+		btr_root_set_auto_inc(table, 0);
+	}
 }
 
 /************************************************************************
@@ -802,14 +826,25 @@ void
 dict_table_autoinc_update_if_greater(
 /*=================================*/
 
-	dict_table_t*	table,	/*!< in/out: table */
-	ib_uint64_t	value)	/*!< in: value which was assigned to a row */
+	dict_table_t*	table,		/*!< in/out: table */
+	ulonglong	increment,	/*!< in: auto increment value */
+	ib_uint64_t	value)		/*!< in: value which was assigned
+					to a row */
 {
 	ut_ad(dict_table_autoinc_own(table));
 
 	if (value > table->autoinc) {
 
 		table->autoinc = value;
+	}
+
+	if (srv_autoinc_persistent
+	    && ((table->autoinc - table->old_autoinc) / increment
+		>= srv_n_autoinc_interval)) {
+
+		table->old_autoinc = table->autoinc;
+		btr_root_set_auto_inc(table,
+			(value + (srv_n_autoinc_interval - 1) * increment));
 	}
 }
 
@@ -1441,7 +1476,7 @@ dict_make_room_in_cache(
 
 		if (dict_table_can_be_evicted(table)) {
 
-			dict_table_remove_from_cache_low(table, TRUE);
+			dict_table_remove_from_cache_low(table, TRUE, TRUE);
 
 			++n_evicted;
 		}
@@ -1720,6 +1755,14 @@ dict_table_rename_in_cache(
 		if (!success) {
 			return(DB_ERROR);
 		}
+	}
+
+	/* persist autoinc value when dict table move from dict cache */
+	if (srv_autoinc_persistent
+	    && srv_n_autoinc_interval > 1
+	    && table->autoinc > 0) {
+
+		btr_root_set_auto_inc(table, table->autoinc);
 	}
 
 	/* Remove table from the hash tables of tables */
@@ -2025,8 +2068,9 @@ void
 dict_table_remove_from_cache_low(
 /*=============================*/
 	dict_table_t*	table,		/*!< in, own: table */
-	ibool		lru_evict)	/*!< in: TRUE if table being evicted
+	ibool		lru_evict,	/*!< in: TRUE if table being evicted
 					to make room in the table LRU list */
+	ibool		autoinc_persistent)/*!< in, own: autoinc_persistent */
 {
 	dict_foreign_t*	foreign;
 	dict_index_t*	index;
@@ -2052,6 +2096,15 @@ dict_table_remove_from_cache_low(
 		foreign = *it;
 		foreign->referenced_table = NULL;
 		foreign->referenced_index = NULL;
+	}
+
+	/* persist autoinc value when dict table move from dict cache */
+	if (autoinc_persistent
+	    && srv_autoinc_persistent
+	    && srv_n_autoinc_interval > 1
+	    && table->autoinc > 0) {
+
+		btr_root_set_auto_inc(table, table->autoinc);
 	}
 
 	/* Remove the indexes from the cache */
@@ -2127,7 +2180,7 @@ dict_table_remove_from_cache(
 /*=========================*/
 	dict_table_t*	table)	/*!< in, own: table */
 {
-	dict_table_remove_from_cache_low(table, FALSE);
+	dict_table_remove_from_cache_low(table, FALSE, FALSE);
 }
 
 /****************************************************************//**
@@ -2852,6 +2905,9 @@ dict_index_add_col(
 	if (!(col->prtype & DATA_NOT_NULL)) {
 		index->n_nullable++;
 	}
+
+	index->n_null_arr[index->n_def -1] = index->n_nullable;
+	ut_ad(dict_index_validate(index));
 }
 
 #ifndef UNIV_HOTBACKUP
@@ -5110,6 +5166,8 @@ dict_index_build_node_ptr(
 	dtype_set(dfield_get_type(field), DATA_SYS_CHILD, DATA_NOT_NULL, 4);
 
 	rec_copy_prefix_to_dtuple(tuple, rec, index, n_unique, heap);
+	/* Inherit tuple->info_bits from phyical record, Maybe the node_ptr
+	has rec_comfort flag. if flag, it also will include n_fields. */
 	dtuple_set_info_bits(tuple, dtuple_get_info_bits(tuple)
 			     | REC_STATUS_NODE_PTR);
 
@@ -6411,7 +6469,30 @@ dict_lru_validate(void)
 
 	return(TRUE);
 }
+/**********************************************************************//**
+Validate the index n_null_arr.
+@return TRUE if valid  */
+static
+ibool
+dict_index_validate(
+/*================*/
+	const dict_index_t*	index)		/*!< in: index */
+{
+	unsigned int n_nulls;
+	dict_field_t*	field;
 
+	n_nulls= 0;
+	for (uint i = 0; i < index->n_def; i++) {
+		field = dict_index_get_nth_field(index, i);
+		if (!(field->col->prtype & DATA_NOT_NULL)) {
+			n_nulls++;
+			ut_a(index->n_null_arr[i] == n_nulls);
+		}
+	}
+	ut_a(n_nulls == index->n_nullable);
+
+	return(TRUE);
+}
 /**********************************************************************//**
 Check if a table exists in the dict table LRU list.
 @return TRUE if table found in LRU list */
@@ -6737,6 +6818,8 @@ dict_tf_to_row_format_string(
 		return("ROW_TYPE_COMPRESSED");
 	case REC_FORMAT_DYNAMIC:
 		return("ROW_TYPE_DYNAMIC");
+	case REC_FORMAT_COMFORT:
+		return("ROW_TYPE_COMFORT");
 	}
 
 	ut_error;
